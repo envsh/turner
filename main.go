@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -78,11 +79,11 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 	if strings.Index(target, ":") == -1 {
 		peer = fmt.Sprintf("%s:%s", target, port)
 	}
-	fmt.Printf("[*] Proxy to peer: %s\n", peer)
+	log.Printf("[*] Proxy to peer: %s", peer)
 
 	stunConnector, err := connectTurn(peer)
 	if err != nil {
-		fmt.Printf("[x] error setting up STUN %s\n", err)
+		log.Printf("[x] error setting up STUN %s", err)
 		http.Error(w, "Proxy encountered error", http.StatusInternalServerError)
 		return
 	}
@@ -133,7 +134,7 @@ func handleProxyTun(w http.ResponseWriter, r *http.Request) {
 
 	stunConnector, err := connectTurn(peer)
 	if err != nil {
-		fmt.Printf("[x] error setting up STUN %s\n", err)
+		log.Printf("[x] error setting up STUN %s", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		//clientConn.Write([]byte("Proxy encountered error"))
 		return
@@ -169,22 +170,22 @@ func connectTurn(target string) (*turner.StunConnection, error) {
 	// Resolving to TURN server.
 	raddr, err := net.ResolveTCPAddr("tcp", *server)
 	if err != nil {
-		fmt.Println(err)
+		log.Println(err)
 		return nil, err
 	}
 	c, err := net.DialTCP("tcp", nil, raddr)
 	if err != nil {
-		fmt.Println(err)
+		log.Println(err)
 		return nil, err
 	}
-	fmt.Printf("[*] Dial server %s -> %s\n", c.LocalAddr(), c.RemoteAddr())
+	log.Printf("[*] Dial server %s -> %s", c.LocalAddr(), c.RemoteAddr())
 	client, clientErr := turnc.New(turnc.Options{
 		Conn:     c,
 		Username: *username,
 		Password: *password,
 	})
 	if clientErr != nil {
-		fmt.Println(clientErr)
+		log.Println(clientErr)
 		c.Close()
 		return nil, clientErr
 	}
@@ -211,7 +212,7 @@ func connectTurn(target string) (*turner.StunConnection, error) {
 	}
 
 	if allocErr != nil {
-		fmt.Println(allocErr)
+		log.Println(allocErr)
 		client.Close()
 		return nil, allocErr
 	}
@@ -221,20 +222,20 @@ func connectTurn(target string) (*turner.StunConnection, error) {
 		client.Close()
 		return nil, resolveErr
 	}
-	fmt.Println("[*] Create peer permission")
+	log.Println("[*] Create peer permission")
 	permission, createErr := alloc.Create(peerAddr.IP)
 	if createErr != nil {
 		client.Close()
 		return nil, createErr
 	}
-	fmt.Println("[*] Create TCP Session Connection")
+	log.Println("[*] Create TCP Session Connection")
 	conn, err := permission.CreateTCP(peerAddr)
 	if err != nil {
 		client.Close()
 		return nil, err
 	}
 
-	fmt.Println("[*] Create connect request")
+	log.Println("[*] Create connect request")
 	var connid stun.RawAttribute
 	if connid, err = conn.Connect(); err != nil {
 		client.Close()
@@ -242,14 +243,14 @@ func connectTurn(target string) (*turner.StunConnection, error) {
 	}
 
 	// setup bind
-	fmt.Println("[*] Create bind TCP connection")
+	log.Println("[*] Create bind TCP connection")
 	cb, err := net.DialTCP("tcp", nil, raddr)
 	if err != nil {
 		client.Close()
 		return nil, err
 	}
 
-	fmt.Println("[*] Auth and Create client ")
+	log.Println("[*] Auth and Create client ")
 	sideChanReader, sideChanWriter := io.Pipe()
 	r := io.MultiReader(sideChanReader, cb)
 
@@ -269,7 +270,7 @@ func connectTurn(target string) (*turner.StunConnection, error) {
 		return nil, err
 	}
 
-	fmt.Println("[*] Bind client ")
+	log.Println("[*] Bind client ")
 
 	_, err = clientb.ConnectionBind(turn.ConnectionID(binary.BigEndian.Uint32(connid.Value)), alloc, connD)
 	if err != nil {
@@ -282,7 +283,7 @@ func connectTurn(target string) (*turner.StunConnection, error) {
 		conn.Read(buf)
 		fmt.Println(buf)
 	*/
-	fmt.Println("[*] Bound")
+	log.Println("[*] Bound")
 
 	stunConnector.CntrClient = *client
 	stunConnector.DataClient = *clientb
@@ -301,17 +302,18 @@ func turnDial(ctx context.Context, network, addr string) (net.Conn, error) {
 }
 
 func main() {
+	log.SetFlags(log.Lshortfile | log.Ltime)
 	flag.Parse()
 
 	if !*httpProx && !*socksProx {
-		fmt.Println("[x] No mode selected. Use either, or both, -http or -socks5")
+		log.Println("[x] No mode selected. Use either, or both, -http or -socks5")
 		return
 	}
 	errChan := make(chan error)
 
 	if *httpProx {
 		go func(errChan chan error) {
-			fmt.Printf("[*] Starting HTTP Server on %s:%d\n", *httpHost, *httpPort)
+			log.Printf("[*] Starting HTTP Server on %s:%d", *httpHost, *httpPort)
 			httpServer := &http.Server{
 				Addr: fmt.Sprintf("%s:%d", *httpHost, *httpPort),
 				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -329,7 +331,7 @@ func main() {
 	}
 
 	if *socksProx {
-		fmt.Printf("[*] Starting SOCKS5 Server on %s:%d\n", *socksHost, *socksPort)
+		log.Printf("[*] Starting SOCKS5 Server on %s:%d", *socksHost, *socksPort)
 		go func(errChan chan error) {
 			conf := &socks5.Config{Dial: turnDial}
 			server, err := socks5.New(conf)
@@ -345,6 +347,6 @@ func main() {
 
 	select {
 	case <-errChan:
-		fmt.Println("Error setting up server.", errChan)
+		log.Println("Error setting up server.", errChan)
 	}
 }

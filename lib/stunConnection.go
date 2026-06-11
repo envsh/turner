@@ -1,8 +1,8 @@
 package turner
 
 import (
-	"fmt"
 	"io"
+	"log"
 	"net"
 	"time"
 
@@ -31,7 +31,7 @@ func (c *StunConnection) Close() error {
 	if c == nil {
 		return nil
 	}
-	fmt.Println("[*] Shut it all down")
+	log.Println("[*] Shut it all down")
 
 	return c.Conn.Close()
 }
