@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/armon/go-socks5"
 	turner "github.com/staaldraad/turner/lib"
@@ -134,7 +135,7 @@ func handleProxyTun(w http.ResponseWriter, r *http.Request) {
 
 	stunConnector, err := connectTurn(peer)
 	if err != nil {
-		log.Printf("[x] error setting up STUN %s", err)
+		log.Printf("[x] error setting up STUN %s %v %v", err, peer, port)
 		w.WriteHeader(http.StatusInternalServerError)
 		//clientConn.Write([]byte("Proxy encountered error"))
 		return
@@ -163,12 +164,50 @@ func transfer(destination io.WriteCloser, source io.ReadCloser) {
 	io.Copy(destination, source)
 }
 
+var (
+	dnsIdx  int
+	dnsMu   sync.Mutex
+	dnsList = []string{"1.1.1.1:53", "8.8.8.8:53"}
+)
+
+var customResolver = &net.Resolver{
+	Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+		dnsMu.Lock()
+		srv := dnsList[dnsIdx%len(dnsList)]
+		dnsIdx++
+		dnsMu.Unlock()
+		d := net.Dialer{}
+		return d.DialContext(ctx, "udp", srv)
+	},
+}
+
+func resolveTCPWithDNS(addr string, r *net.Resolver) (*net.TCPAddr, error) {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	port, err := net.LookupPort("tcp", portStr)
+	if err != nil {
+		return nil, err
+	}
+	ctx := context.Background()
+	addrs, err := r.LookupHost(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	ip := net.ParseIP(addrs[0])
+	if ip == nil {
+		return nil, fmt.Errorf("invalid IP: %s", addrs[0])
+	}
+	return &net.TCPAddr{IP: ip, Port: port}, nil
+}
+
 func connectTurn(target string) (*turner.StunConnection, error) {
 
 	stunConnector := &turner.StunConnection{}
 
 	// Resolving to TURN server.
-	raddr, err := net.ResolveTCPAddr("tcp", *server)
+	raddr, err := resolveTCPWithDNS(*server, customResolver)
 	if err != nil {
 		log.Println(err)
 		return nil, err
@@ -217,12 +256,12 @@ func connectTurn(target string) (*turner.StunConnection, error) {
 		return nil, allocErr
 	}
 
-	peerAddr, resolveErr := net.ResolveTCPAddr("tcp", target)
+	peerAddr, resolveErr := resolveTCPWithDNS(target, customResolver)
 	if resolveErr != nil {
 		client.Close()
 		return nil, resolveErr
 	}
-	log.Println("[*] Create peer permission")
+	log.Println("[*] Create peer permission", peerAddr.String())
 	permission, createErr := alloc.Create(peerAddr.IP)
 	if createErr != nil {
 		client.Close()
@@ -257,6 +296,7 @@ func connectTurn(target string) (*turner.StunConnection, error) {
 	clientb, clientErr := turnc.NewData(turnc.Options{
 		Conn:     cb,
 		Username: *username,
+		Password: *password,
 	}, *sideChanWriter)
 
 	if clientErr != nil {
