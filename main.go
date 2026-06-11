@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
@@ -11,12 +10,11 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/armon/go-socks5"
-	turner "github.com/staaldraad/turner/lib"
-	"gortc.io/stun"
-	"gortc.io/turn"
-	"gortc.io/turnc"
+	//"github.com/pion/transport/v2/stdnet"
+	"github.com/pion/turn/v2"
 )
 
 var (
@@ -27,13 +25,13 @@ var (
 
 	username     = flag.String("u", "user", "username")
 	password     = flag.String("p", "secret", "password")
+	realm        = flag.String("r", "", "realm")
 	socksProx    = flag.Bool("socks5", false, "Start a SOCKS5 server")
 	httpProx     = flag.Bool("http", false, "Start HTTP Proxy")
 	socksPort    = flag.Int("sp", 8000, "Port to use for SOCKS server")
 	httpPort     = flag.Int("hp", 8080, "Port to use for HTTP Proxy")
 	socksHost    = flag.String("sh", "127.0.0.1", "Host addr to listen on SOCKS5 (default 127.0.0.1)")
 	httpHost     = flag.String("hh", "127.0.0.1", "Host addr to listen on HTTP (default 127.0.0.1)")
-	translateIPv = flag.Bool("translate", false, "Transalte IP family in target, for example IPv6. Allows connecting to turn server with one version (IPv4) and be relayed to a peer with other (IPv6)")
 )
 
 func copyHeader(dst, src http.Header) {
@@ -82,7 +80,7 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("[*] Proxy to peer: %s", peer)
 
-	stunConnector, err := connectTurn(peer)
+	relayedConn, err := connectTurn(peer)
 	if err != nil {
 		log.Printf("[x] error setting up STUN %s", err)
 		http.Error(w, "Proxy encountered error", http.StatusInternalServerError)
@@ -104,18 +102,18 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 	// create method line
 	methodLine := fmt.Sprintf("%s %s %s\r\n", r.Method, r.URL.Path, r.Proto)
 	hostLine := fmt.Sprintf("Host: %s\r\n", target)
-	stunConnector.Write([]byte(methodLine))
-	stunConnector.Write([]byte(hostLine))
-	stunConnector.Write(bufHeader(r.Header))
-	stunConnector.Write([]byte("\r\n"))
+	relayedConn.Write([]byte(methodLine))
+	relayedConn.Write([]byte(hostLine))
+	relayedConn.Write(bufHeader(r.Header))
+	relayedConn.Write([]byte("\r\n"))
 	//drain body
 
-	io.Copy(stunConnector, r.Body)
-	io.Copy(bufwr, stunConnector)
+	io.Copy(relayedConn, r.Body)
+	io.Copy(bufwr, relayedConn)
 
 	// close the connections
 	defer conn.Close()
-	defer stunConnector.Close()
+	defer relayedConn.Close()
 }
 
 func handleProxyTun(w http.ResponseWriter, r *http.Request) {
@@ -133,7 +131,7 @@ func handleProxyTun(w http.ResponseWriter, r *http.Request) {
 	}
 	peer := r.Host
 
-	stunConnector, err := connectTurn(peer)
+	relayedConn, err := connectTurn(peer)
 	if err != nil {
 		log.Printf("[x] error setting up STUN %s %v %v", err, peer, port)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -153,8 +151,8 @@ func handleProxyTun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	go transfer(stunConnector, clientConn)
-	go transfer(clientConn, stunConnector)
+	go transfer(relayedConn, clientConn)
+	go transfer(clientConn, relayedConn)
 
 }
 
@@ -202,135 +200,118 @@ func resolveTCPWithDNS(addr string, r *net.Resolver) (*net.TCPAddr, error) {
 	return &net.TCPAddr{IP: ip, Port: port}, nil
 }
 
-func connectTurn(target string) (*turner.StunConnection, error) {
-
-	stunConnector := &turner.StunConnection{}
-
-	// Resolving to TURN server.
+func connectTurn(target string) (net.Conn, error) {
 	raddr, err := resolveTCPWithDNS(*server, customResolver)
 	if err != nil {
-		log.Println(err)
+		log.Println(err, raddr)
 		return nil, err
 	}
-	c, err := net.DialTCP("tcp", nil, raddr)
+	conn, err := net.DialTCP("tcp", nil, raddr)
 	if err != nil {
 		log.Println(err)
 		return nil, err
 	}
-	log.Printf("[*] Dial server %s -> %s", c.LocalAddr(), c.RemoteAddr())
-	client, clientErr := turnc.New(turnc.Options{
-		Conn:     c,
-		Username: *username,
-		Password: *password,
+	log.Printf("[*] Dial server %s -> %s", conn.LocalAddr(), conn.RemoteAddr())
+
+	if true {
+		tcp := conn
+		tcp.SetKeepAlive(true)
+		tcp.SetKeepAlivePeriod(15 * time.Second)
+	}
+	stunConn := turn.NewSTUNConn(conn)
+
+/*
+	baseNet, err := stdnet.NewNet()
+	if err != nil {
+		conn.Close()
+		log.Println(err)
+		return nil, err
+	}
+*/
+	log.Println(*username, *password, *realm)
+	serverIP := raddr.String()
+	client, err := turn.NewClient(&turn.ClientConfig{
+		STUNServerAddr: serverIP,
+		TURNServerAddr: serverIP,
+		Conn:           stunConn,
+		// Net:            baseNet,
+		Username:       *username,
+		Password:       *password,
+		Realm:          *realm,
+		// Software:       "turner-proxy",
 	})
-	if clientErr != nil {
-		log.Println(clientErr)
-		c.Close()
-		return nil, clientErr
+	if err != nil {
+		conn.Close()
+		log.Println(err)
+		return nil, err
 	}
-	var alloc *turnc.Allocation
-	var allocErr error
+	if err = client.Listen(); err != nil {
+		client.Close()
+		log.Println(err)
+		return nil, err
+	}
 
-	// do address family selection
-	// this allows:
-	// IPv4 <-> turn-server <-> IPv6
-	// IPv6 <-> turn-server <-> IPv4
-	// hide this behind a flag for now, normal behaviour is to
-	// use the same address family ex: IPv4 <-> turn-server <-> IPv4
-	if *translateIPv {
-		// strip port
-		t := target[:strings.LastIndex(target, ":")]
-		// silly check, IPv4 or hostname should be dotted decimal notation
-		if strings.Count(t, ":") == 0 {
-			alloc, allocErr = client.AllocateTCP4()
-		} else { // ipv6 will have :
-			alloc, allocErr = client.AllocateTCP6()
-		}
+	// 1) AllocateTCP first (sets realm/nonce/integrity from server challenge)
+	log.Println("AllocateTCP...")
+	alloc, err := client.AllocateTCP()
+	if err != nil {
+		client.Close()
+		log.Println(err)
+		return nil, err
+	}
+	log.Printf("relay addr = %s", alloc.Addr())
+
+	// 2) Binding after Allocate (turnpool pattern)
+	if maddr, err := client.SendBindingRequest(); err != nil {
+		log.Printf("SendBindingRequest fail: %v (non-fatal)", err)
 	} else {
-		alloc, allocErr = client.AllocateTCP()
+		log.Printf("mapped addr = %s", maddr)
 	}
 
-	if allocErr != nil {
-		log.Println(allocErr)
-		client.Close()
-		return nil, allocErr
-	}
-
-	peerAddr, resolveErr := resolveTCPWithDNS(target, customResolver)
-	if resolveErr != nil {
-		client.Close()
-		return nil, resolveErr
-	}
-	log.Println("[*] Create peer permission", peerAddr.String())
-	permission, createErr := alloc.Create(peerAddr.IP)
-	if createErr != nil {
-		client.Close()
-		return nil, createErr
-	}
-	log.Println("[*] Create TCP Session Connection")
-	conn, err := permission.CreateTCP(peerAddr)
+	// 3) Resolve target
+	targetAddr, err := resolveTCPWithDNS(target, customResolver)
 	if err != nil {
+		alloc.Close()
 		client.Close()
+		log.Println(err)
 		return nil, err
 	}
+	log.Printf("[*] Relay to %s via TURN", targetAddr.String())
 
-	log.Println("[*] Create connect request")
-	var connid stun.RawAttribute
-	if connid, err = conn.Connect(); err != nil {
-		client.Close()
-		return nil, err
+	// 4) CreatePermissions for target (matching turnpool pattern)
+	if err := alloc.CreatePermissions(targetAddr); err != nil {
+		log.Printf("CreatePermissions fail: %v", err)
 	}
+	
+	//ttaddr := &net.TCPAddr{IP: net.IPv4(8, 8, 8, 8), Port: 53}
+	ttaddr := &net.TCPAddr{IP: net.IPv4(185, 45, 5, 35), Port: 443}
+	cid, err := alloc.Connect(ttaddr)
+	log.Println(cid, err)
+	
+	_, err = alloc.DialTCP("tcp", nil, targetAddr)
+	log.Println(err)
 
-	// setup bind
-	log.Println("[*] Create bind TCP connection")
-	cb, err := net.DialTCP("tcp", nil, raddr)
+	// 5) Dial data connection + Connect + BindConnection
+	dataConn, err := net.DialTCP("tcp", nil, raddr)
 	if err != nil {
+		alloc.Close()
 		client.Close()
+		log.Println(err)
 		return nil, err
 	}
 
-	log.Println("[*] Auth and Create client ")
-	sideChanReader, sideChanWriter := io.Pipe()
-	r := io.MultiReader(sideChanReader, cb)
-
-	clientb, clientErr := turnc.NewData(turnc.Options{
-		Conn:     cb,
-		Username: *username,
-		Password: *password,
-	}, *sideChanWriter)
-
-	if clientErr != nil {
-		client.Close()
-		return nil, clientErr
-	}
-
-	connD, err := permission.CreateTCP(peerAddr)
+	log.Printf("DialTCPWithConn to %s...", targetAddr.String())
+	relayedConn, err := alloc.DialTCPWithConn(dataConn, "tcp", targetAddr)
 	if err != nil {
+		dataConn.Close()
+		alloc.Close()
 		client.Close()
+		log.Printf("DialTCPWithConn FAIL: %v, 446 maybe not support RFC 6062 出站 relay", err)
 		return nil, err
 	}
+	log.Printf("DialTCPWithConn OK")
 
-	log.Println("[*] Bind client ")
-
-	_, err = clientb.ConnectionBind(turn.ConnectionID(binary.BigEndian.Uint32(connid.Value)), alloc, connD)
-	if err != nil {
-		client.Close()
-		clientb.Close()
-		return nil, err
-	}
-	/*
-		buf := make([]byte, 10)
-		conn.Read(buf)
-		fmt.Println(buf)
-	*/
-	log.Println("[*] Bound")
-
-	stunConnector.CntrClient = *client
-	stunConnector.DataClient = *clientb
-	stunConnector.Conn = cb
-	stunConnector.MultiRead = r
-
-	return stunConnector, nil
+	return relayedConn, nil
 }
 
 func turnDial(ctx context.Context, network, addr string) (net.Conn, error) {
